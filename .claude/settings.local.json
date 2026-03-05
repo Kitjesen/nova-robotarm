@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:arxiv.org)",
+      "WebFetch(domain:diffusion-policy.cs.columbia.edu)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:elib.dlr.de)",
+      "WebFetch(domain:graspnet.net)",
+      "WebFetch(domain:tonyzhaozh.github.io)",
+      "WebFetch(domain:docs.isaacsim.omniverse.nvidia.com)",
+      "WebFetch(domain:isaac-sim.github.io)",
+      "WebFetch(domain:pypi.org)",
+      "WebFetch(domain:docs.nvidia.com)",
+      "WebFetch(domain:medium.com)",
+      "WebFetch(domain:forums.developer.nvidia.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:www.mdpi.com)"
+    ]
+  }
+}
