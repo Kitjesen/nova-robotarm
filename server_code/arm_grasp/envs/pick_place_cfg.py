@@ -1,17 +1,18 @@
-"""Pick-and-Place v8.10: fix two confirmed bugs from v8.9.
+"""Pick-and-Place v9.0: official Isaac Lab reward structure.
 
-Bug 1 fixed: drop_penalty threshold (0.50) was below termination (0.60).
-  Reward is computed BEFORE termination check each step.
-  Object drops to z=0.61 -> penalty checks 0.61 > 0.50 -> no penalty
-  Then termination fires. Penalty NEVER triggered.
-  Fix: drop_penalty min_height 0.50->0.72, termination 0.60->0.65
+Strategy: mirror the proven 6-term Isaac Lab lift reward.
+No grasp detection gating — robot learns to grasp implicitly
+by being rewarded for lifting height (object_is_lifted fires
+only when object actually moves up, requires physical contact).
 
-Bug 2 fixed: grasp_threshold=0.12m too large.
-  At 12cm distance, 4cm-wide object cannot be physically gripped.
-  All grasp-gated rewards (upvel, lifting, goal) fired with no real grasp.
-  Fix: grasp_threshold 0.12->0.09m (still generous but physically meaningful)
-
-v8.9 kept: gripper starts OPEN (0.04), velocity reward, no grasped_ee_height.
+Key changes from v8.10:
+  - Removed: grasp, grasped_upvel, grasped_height, grasped_goal,
+              drop_penalty, joint_deviation (11 terms → 6 terms)
+  - object_is_lifted: binary reward weight=15 (official: 15)
+  - reaching: std=0.1 weight=1 (official: 1)
+  - object_goal_distance: std=0.3/0.05 (official: 0.3/0.05)
+  - minimal_height=0.82 (object starts at z=0.78, table top=0.75)
+  - max_iterations: 5000 → 18000
 """
 
 import isaaclab.sim as sim_utils
@@ -39,7 +40,6 @@ class PickPlaceSceneCfg(InteractiveSceneCfg):
 
     robot = ARM_6DOF_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
     robot.init_state.pos = (0.0, 0.0, 0.75)
-    # v8.9: gripper starts OPEN
     robot.init_state.joint_pos = {
         "joint_1": 0.0,
         "joint_2": 0.0,
@@ -182,80 +182,54 @@ class EventCfg:
 
 @configclass
 class RewardsCfg:
-    """v8.10: two bug fixes on top of v8.9.
+    """v9.0: official Isaac Lab 6-term reward structure.
 
-    Bug 1 fix: drop_penalty 0.50->0.72, termination 0.60->0.65
-      penalty now fires BEFORE termination (table surface = 0.75)
-
-    Bug 2 fix: grasp_threshold 0.12->0.09m
-      more physically meaningful; 9cm allows correct approach geometry
+    Mirrors Isaac-Lift-Cube-Franka reward exactly, adapted for our scene.
+    - reaching_object: approach reward (std=0.1, weight=1.0)
+    - lifting_object: binary reward when z > 0.82 (weight=15.0)
+    - object_goal_tracking: coarse goal (std=0.3, weight=16.0)
+    - object_goal_tracking_fine: fine goal (std=0.05, weight=5.0)
+    - action_rate + joint_vel: smoothness penalties
     """
 
-    reaching = RewTerm(func=mdp.reaching_penalty, weight=3.0)
-    reaching_fine = RewTerm(func=mdp.reaching_bonus, params={"std": 0.3}, weight=8.0)
+    # Approach: 1 - tanh(dist / 0.1), std=0.1 gives strong gradient within 20cm
+    reaching_object = RewTerm(
+        func=mdp.reaching_bonus,
+        params={"std": 0.1},
+        weight=1.0,
+    )
 
-    grasp = RewTerm(
-        func=mdp.grasp_reward,
-        params={"threshold": 0.09, "open_pos": 0.04},  # 0.12 -> 0.09
-        weight=3.0,
-    )
-    grasped_object_upvel = RewTerm(
-        func=mdp.grasped_object_upvel_reward,
-        params={"scale": 0.3, "grasp_threshold": 0.09, "open_pos": 0.04},  # 0.12 -> 0.09
-        weight=25.0,
-    )
+    # Lifting: binary 1.0 when object z > 0.82 (4cm above initial z=0.78)
+    # No grasp detection — robot learns to grasp implicitly to achieve lift
     lifting_object = RewTerm(
-        func=mdp.grasped_height_reward,
-        params={
-            "initial_height": 0.78, "max_bonus_height": 1.0,
-            "grasp_threshold": 0.09, "open_pos": 0.04,  # 0.12 -> 0.09
-        },
-        weight=20.0,
+        func=mdp.object_is_lifted,
+        params={"minimal_height": 0.82},
+        weight=15.0,
     )
+
+    # Goal tracking: only active when object is lifted (minimal_height=0.82)
     object_goal_tracking = RewTerm(
-        func=mdp.grasped_goal_distance,
-        params={
-            "std": 0.3, "command_name": "object_pose", "minimal_height": 0.80,
-            "grasp_threshold": 0.09, "open_pos": 0.04,  # 0.12 -> 0.09
-        },
+        func=mdp.object_goal_distance,
+        params={"std": 0.3, "minimal_height": 0.82, "command_name": "object_pose"},
         weight=16.0,
     )
     object_goal_tracking_fine = RewTerm(
-        func=mdp.grasped_goal_distance,
-        params={
-            "std": 0.05, "command_name": "object_pose", "minimal_height": 0.80,
-            "grasp_threshold": 0.09, "open_pos": 0.04,  # 0.12 -> 0.09
-        },
+        func=mdp.object_goal_distance,
+        params={"std": 0.05, "minimal_height": 0.82, "command_name": "object_pose"},
         weight=5.0,
     )
 
-    # Bug 1 fix: 0.50 -> 0.72 (fires 3cm below table surface, BEFORE termination at 0.65)
-    drop_penalty = RewTerm(
-        func=mdp.object_dropped_penalty,
-        params={"min_height": 0.72},
-        weight=-20.0,
-    )
-
+    # Smoothness penalties (unchanged from official)
     action_rate = RewTerm(func=mdp.action_rate_l2, weight=-1e-4)
     joint_vel = RewTerm(
         func=mdp.joint_vel_l2, weight=-1e-4,
         params={"asset_cfg": SceneEntityCfg("robot")},
-    )
-    joint_deviation = RewTerm(
-        func=mdp.joint_deviation_l1, weight=-0.3,
-        params={"asset_cfg": SceneEntityCfg(
-            "robot",
-            joint_names=["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6"],
-        )},
     )
 
 
 @configclass
 class TerminationsCfg:
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
-    # Bug 1 fix: 0.60 -> 0.65 (above drop_penalty threshold 0.72? No: 0.65 < 0.72)
-    # Order: penalty fires at 0.72 (step N), termination fires at 0.65 (step N+k)
-    # Both fire correctly now.
     object_dropping = DoneTerm(
         func=mdp.root_height_below_minimum,
         params={"minimum_height": 0.65, "asset_cfg": SceneEntityCfg("object")},
