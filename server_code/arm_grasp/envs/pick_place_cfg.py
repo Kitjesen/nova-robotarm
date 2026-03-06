@@ -58,7 +58,7 @@ class PickPlaceSceneCfg(InteractiveSceneCfg):
             FrameTransformerCfg.FrameCfg(
                 prim_path="{ENV_REGEX_NS}/Robot/link_6",
                 name="end_effector",
-                offset=OffsetCfg(pos=(0.0, 0.0, 0.05)),
+                offset=OffsetCfg(pos=(0.0, 0.0, 0.09)),  # gripper finger mid-grip point (~9cm from link_6)
             ),
         ],
     )
@@ -149,21 +149,59 @@ class ActionsCfg:
 
 @configclass
 class ObservationsCfg:
+    """Asymmetric Actor-Critic observations.
+
+    Actor (policy): observations available on real robot via FK + depth camera.
+    Critic (privileged): adds object velocity/angular velocity — hard to measure
+    on real hardware without IMU on object. Critic is discarded at deployment.
+
+    Reference: Privileged Action paper (arXiv 2502.15442), DrS (ICLR 2024).
+    """
+
     @configclass
     class PolicyCfg(ObsGroup):
-        joint_pos = ObsTerm(func=mdp.joint_pos_rel)
-        joint_vel = ObsTerm(func=mdp.joint_vel_rel)
-        object_position = ObsTerm(func=mdp.object_position_in_robot_root_frame)
+        """Actor observations — all available on real robot."""
+        joint_pos = ObsTerm(func=mdp.joint_pos_rel)           # 8D
+        joint_vel = ObsTerm(func=mdp.joint_vel_rel)           # 8D
+        object_position = ObsTerm(func=mdp.object_position_in_robot_root_frame)  # 3D
+        ee_position = ObsTerm(func=mdp.ee_position_in_robot_frame)               # 3D
+        ee_to_object = ObsTerm(func=mdp.ee_to_object_vector)                     # 3D
+        gripper_opening = ObsTerm(func=mdp.gripper_opening)                      # 2D
         target_object_position = ObsTerm(
             func=mdp.generated_commands, params={"command_name": "object_pose"}
-        )
-        actions = ObsTerm(func=mdp.last_action)
+        )                                                      # 7D
+        actions = ObsTerm(func=mdp.last_action)               # 7D
+        # Total: 41D
 
         def __post_init__(self):
             self.enable_corruption = True
             self.concatenate_terms = True
 
+    @configclass
+    class CriticCfg(ObsGroup):
+        """Critic observations — actor obs + privileged info (training only)."""
+        # Same as actor
+        joint_pos = ObsTerm(func=mdp.joint_pos_rel)
+        joint_vel = ObsTerm(func=mdp.joint_vel_rel)
+        object_position = ObsTerm(func=mdp.object_position_in_robot_root_frame)
+        ee_position = ObsTerm(func=mdp.ee_position_in_robot_frame)
+        ee_to_object = ObsTerm(func=mdp.ee_to_object_vector)
+        gripper_opening = ObsTerm(func=mdp.gripper_opening)
+        target_object_position = ObsTerm(
+            func=mdp.generated_commands, params={"command_name": "object_pose"}
+        )
+        actions = ObsTerm(func=mdp.last_action)
+        # Privileged: object dynamics (unknown on real robot without sensors)
+        object_lin_vel = ObsTerm(func=mdp.object_velocity_in_robot_frame)  # 3D
+        object_ang_vel = ObsTerm(func=mdp.object_ang_vel_w)                # 3D
+        # Total: 47D
+
+        def __post_init__(self):
+            self.enable_corruption = False  # no noise for critic
+            self.concatenate_terms = True
+
     policy: PolicyCfg = PolicyCfg()
+    critic: CriticCfg = CriticCfg()
 
 
 @configclass
@@ -182,44 +220,66 @@ class EventCfg:
 
 @configclass
 class RewardsCfg:
-    """v9.0: official Isaac Lab 6-term reward structure.
+    """v9.1: lift_cube proven reward structure, adapted for pick_place scene.
 
-    Mirrors Isaac-Lift-Cube-Franka reward exactly, adapted for our scene.
-    - reaching_object: approach reward (std=0.1, weight=1.0)
-    - lifting_object: binary reward when z > 0.82 (weight=15.0)
-    - object_goal_tracking: coarse goal (std=0.3, weight=16.0)
-    - object_goal_tracking_fine: fine goal (std=0.05, weight=5.0)
-    - action_rate + joint_vel: smoothness penalties
+    Key insight: reaching_penalty (-distance) has constant gradient at any
+    distance. reaching_bonus (1-tanh) gradient vanishes >0.5m — unusable
+    when arm starts far from object. lift_cube used reaching_penalty and
+    succeeded (reward +34.3). Copying that structure here.
     """
 
-    # Approach: 1 - tanh(dist / 0.1), std=0.1 gives strong gradient within 20cm
-    reaching_object = RewTerm(
+    # Global approach: -distance, constant gradient regardless of how far
+    reaching = RewTerm(func=mdp.reaching_penalty, weight=5.0)
+    # Fine approach: standard proximity bonus (gripper state irrelevant here)
+    reaching_fine = RewTerm(
         func=mdp.reaching_bonus,
         params={"std": 0.1},
-        weight=1.0,
+        weight=10.0,
     )
 
-    # Lifting: binary 1.0 when object z > 0.82 (4cm above initial z=0.78)
-    # No grasp detection — robot learns to grasp implicitly to achieve lift
-    lifting_object = RewTerm(
-        func=mdp.object_is_lifted,
-        params={"minimal_height": 0.82},
-        weight=15.0,
-    )
-
-    # Goal tracking: only active when object is lifted (minimal_height=0.82)
-    object_goal_tracking = RewTerm(
-        func=mdp.object_goal_distance,
-        params={"std": 0.3, "minimal_height": 0.82, "command_name": "object_pose"},
-        weight=16.0,
-    )
-    object_goal_tracking_fine = RewTerm(
-        func=mdp.object_goal_distance,
-        params={"std": 0.05, "minimal_height": 0.82, "command_name": "object_pose"},
+    # Grasp: close gripper when EE near object
+    grasp = RewTerm(
+        func=mdp.grasp_reward,
+        params={"threshold": 0.08, "open_pos": 0.04},
         weight=5.0,
     )
 
-    # Smoothness penalties (unchanged from official)
+    # Lift incentive: reward upward velocity of object when grasped.
+    # Breaks "grab and hold" — robot must move up to earn reward after grasping.
+    grasped_upvel = RewTerm(
+        func=mdp.grasped_object_upvel_reward,
+        params={"scale": 0.3, "grasp_threshold": 0.08, "open_pos": 0.04},
+        weight=10.0,
+    )
+
+    # Continuous height gain: gated on gripper actually holding the object
+    object_height = RewTerm(
+        func=mdp.grasped_height_reward,
+        params={"initial_height": 0.78, "max_bonus_height": 1.0,
+                "grasp_threshold": 0.08, "open_pos": 0.04},
+        weight=10.0,
+    )
+    # Binary lift bonus: gated on gripper holding
+    lifting_object = RewTerm(
+        func=mdp.grasped_and_lifted,
+        params={"minimal_height": 0.82, "grasp_threshold": 0.08, "open_pos": 0.04},
+        weight=5.0,
+    )
+
+    # Goal tracking: gated on gripper holding
+    object_goal_tracking = RewTerm(
+        func=mdp.grasped_goal_distance,
+        params={"std": 0.5, "minimal_height": 0.82, "grasp_threshold": 0.08,
+                "open_pos": 0.04, "command_name": "object_pose"},
+        weight=16.0,
+    )
+    object_goal_tracking_fine = RewTerm(
+        func=mdp.grasped_goal_distance,
+        params={"std": 0.05, "minimal_height": 0.82, "grasp_threshold": 0.08,
+                "open_pos": 0.04, "command_name": "object_pose"},
+        weight=5.0,
+    )
+
     action_rate = RewTerm(func=mdp.action_rate_l2, weight=-1e-4)
     joint_vel = RewTerm(
         func=mdp.joint_vel_l2, weight=-1e-4,

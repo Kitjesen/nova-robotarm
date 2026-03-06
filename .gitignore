@@ -6,8 +6,8 @@ build/
 install/
 log/
 
-# 参考资料/大文件
-ref/
+# 参考资料/大文件（MD文档追踪，PDF不追踪）
+ref/papers/
 zip_extracted/
 *.rar
 *.zip

@@ -116,3 +116,16 @@ def gripper_opening(
     robot: Articulation = env.scene[robot_cfg.name]
     gripper_pos = robot.data.joint_pos[:, -2:]
     return gripper_pos
+
+
+def object_ang_vel_w(
+    env: ManagerBasedRLEnv,
+    object_cfg: SceneEntityCfg = SceneEntityCfg("object"),
+) -> torch.Tensor:
+    """Object angular velocity in world frame (3D).
+
+    Privileged observation: tells critic if object is tumbling/spinning.
+    Hard to measure on real robot without IMU on object.
+    """
+    obj: RigidObject = env.scene[object_cfg.name]
+    return obj.data.root_ang_vel_w[:, :3]
